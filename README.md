@@ -333,7 +333,7 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | POST | `/api/drafts/{id}/electricity` | 已归档炉次电费试算（只读冻结曲线，不保存；未知 404 / 未归档或参数非法 422） |
 | GET | `/api/drafts/{id}/sheet` | 下载已归档炉次的单份离线 HTML 工艺单（UTF-8 HTML 附件；未知 404 / 未归档 422；只读归档快照，不写库） |
 | GET | `/api/furnace-plan` | 读取单台炉开炉计划（version + 排段，按开始分钟、ID 排序；空计划版本 1） |
-| PUT | `/api/furnace-plan` | 批量提交 1～20 项改动（非负整数 Unix 开始分钟，null 移除，未提及保留；同批可交换；版本过期/重叠 409、未知炉次 404、未归档/非法输入 422；成功整批写入、版本 +1） |
+| PUT | `/api/furnace-plan` | 批量提交 1～20 项改动（非负整数 Unix 开始分钟，null 移除，未提及保留；同批可交换；版本过期/重叠 409、未知炉次（含超出有符号 64 位整数范围的 ID）404、未归档/开始分钟超出有符号 64 位范围/非法输入 422；成功整批写入、版本 +1） |
 
 ### 从零编排（可直接复制执行）
 
@@ -995,10 +995,15 @@ content-disposition: attachment; filename="draft-1-v1-sheet.html";
 
 - **409**：版本过期（响应体附 `currentVersion`，重新 GET 后再提交），
   或改动后存在排段重叠（中文说明冲突的两段炉次与区间）；
-- **404**：改动中的炉次 ID 未知；
+- **404**：改动中的炉次 ID 未知（**包括超出 SQLite 有符号 64 位整数范围、
+  无法入库查询的 ID**，如 `9223372036854775808`）；
 - **422**：炉次存在但**未归档**（活动 / 无解 / 已作废草稿，`null`
-  移除同样要求已归档），或请求体非法（版本 <1、改动非 1～20 项、ID
-  重复、开始分钟为负数 / 小数 / 布尔 / 字符串等）。
+  移除同样要求已归档），或已归档炉次的 `startMinute` **超出 SQLite
+  有符号 64 位整数范围（`0～9223372036854775807`）无法原样存入**，
+  或请求体非法（版本 <1、改动非 1～20 项、ID
+  重复、开始分钟为负数 / 小数 / 布尔 / 字符串等）。越界的开始分钟不会被
+  截断、不会转为浮点数；可存储的非负整数（含 `9223372036854775807`
+  本身）照常接受。
 
 并发与隔离：整批改动在**单条事务**里提交，同版本并发 PUT 只有**一批**
 成功，其余收到 **409**；任何 GET 都不会读到提交到一半的批次，看到的
@@ -1117,6 +1122,73 @@ curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
   -d '{"version": 3, "changes": [{"draftId": 4, "startMinute": 0}]}'
 # HTTP/1.1 422 Unprocessable Entity（炉次 4 还是活动草稿）
 # {"detail":"炉次 4 尚未归档，开炉计划只能安排已归档炉次。"}
+```
+
+#### 超出 SQLite 有符号 64 位范围的整数 —— 404 / 422，不截断、不转浮点
+
+炉次 ID 超出有符号 64 位整数范围（如 `2^63 = 9223372036854775808`）
+时不可能存在于库中，服务在任何查询 / 写入之前就按**未知炉次**返回
+**404**（`null` 移除同样如此）；负数方向超出范围（小于
+`-9223372036854775808`）同理：
+
+```bash
+# draftId 超出有符号 64 位整数上界 → 404
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3,
+       "changes": [{"draftId": 9223372036854775808, "startMinute": 0}]}'
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 9223372036854775808 不存在。"}
+
+# 越界 ID 即使是 null 移除，也同样 404
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3,
+       "changes": [{"draftId": 9223372036854775808, "startMinute": null}]}'
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 9223372036854775808 不存在。"}
+```
+
+已归档炉次的 `startMinute` 是非负整数，但 SQLite 整数列只能存到
+`9223372036854775807`；越界值无法原样保存，服务在写入前返回 **422** 并
+给出中文原因（不截断、不转为浮点数），**整批拒绝**——同批里的其他合法
+改动也不会生效，计划条目与 `version` 均保持不变，
+`GET /api/furnace-plan` 仍读回原计划：
+
+```bash
+# startMinute = 2^63，已归档炉次 1 → 422
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3,
+       "changes": [{"draftId": 1, "startMinute": 9223372036854775808}]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"炉次 1 的开始分钟 9223372036854775808 超出 SQLite 有符号 64 位整数范围（0～9223372036854775807），无法保存，请改用可存储的非负整数。"}
+
+# 同一批里混合了合法改动（炉次 2 改到 29851860）与越界项（炉次 1）：
+# 整批拒绝，炉次 2 也不会被改动；随后 GET 读回的仍是提交前的计划
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3,
+       "changes": [{"draftId": 2, "startMinute": 29851860},
+                   {"draftId": 1, "startMinute": 9223372036854775808}]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"炉次 1 的开始分钟 9223372036854775808 超出 SQLite 有符号 64 位整数范围（0～9223372036854775807），无法保存，请改用可存储的非负整数。"}
+
+curl -sS http://localhost:8000/api/furnace-plan
+# {"version":3,"items":[ ...与失败的提交完全相同... ]}
+```
+
+范围上界 `9223372036854775807` 本身以及任意更小的非负整数都可正常保存
+（返回的 `endMinute` 由开始分钟加档数时长计算、不入库，允许超出上界）：
+
+```bash
+curl -sS -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3,
+       "changes": [{"draftId": 1, "startMinute": 9223372036854775807}]}'
+# HTTP/1.1 200 OK
+# {"version":4,"items":[{"draftId":1,
+#   "startMinute":9223372036854775807,"endMinute":9223372036854775837}]}
 ```
 
 ## 目录结构
