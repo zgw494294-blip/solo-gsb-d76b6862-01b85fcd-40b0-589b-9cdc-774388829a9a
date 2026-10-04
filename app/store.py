@@ -1041,6 +1041,12 @@ def check_archived_reuse(draft_id: int) -> dict:
 # ---------------- 单台炉开炉计划（仅安排已归档炉次） ----------------
 
 
+# SQLite 整数列是有符号 64 位：超出范围的 Python int 无法作为 INTEGER
+# 绑定（直接抛 OverflowError），不截断、也不转浮点数
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
+
+
 def _plan_items(conn) -> list[dict]:
     """在已持锁的连接上读取计划全部排段。
 
@@ -1095,7 +1101,9 @@ def submit_furnace_plan(
     - 每项 (draft_id, start)：start 为非负整数 Unix 分钟表示设置 / 覆盖，
       None 表示移除该炉次（原本没有该炉次时为空操作）；同一批炉次 ID 不
       重复已由路由层以 422 拦截；
-    - 未知炉次 => 404；炉次存在但未归档 => 422（移除同样要求已归档）；
+    - 未知炉次（含超出 SQLite 有符号 64 位整数范围、无法绑定查询的 ID）
+      => 404；炉次存在但未归档 => 422（移除同样要求已归档）；开始分钟超出
+      SQLite 可存储范围（>2^63-1）=> 422（中文原因，不截断、不转浮点）；
       每炉次时长取归档冻结曲线档数 × 5 分钟，不读当前配方、不重新求解；
     - 携带的查看版本与当前不一致 => 409（附当前版本）；
     - 按改动后的全部排段 [start, end) 判冲突：区间严格重叠才冲突，首尾
@@ -1116,27 +1124,44 @@ def submit_furnace_plan(
                     current_version,
                 )
 
-            # 引用炉次必须存在且已归档：未知 => 404，未归档 => 422。
-            # 按请求顺序给出第一个不合规炉次。
+            # 引用炉次必须存在且已归档：未知 => 404，未归档 => 422；
+            # startMinute 还必须能原样存入 SQLite（有符号 64 位非负整数，
+            # 不截断、不转浮点），存不下 => 422。按请求顺序给出第一个不合规
+            # 炉次。超出 SQLite 整数范围的 ID 无法绑定查询，直接按未知处理。
             change_ids = [draft_id for draft_id, _ in changes]
-            placeholders = ",".join("?" * len(change_ids))
-            rows = conn.execute(
-                f"""SELECT d.id AS id, a.id AS archive_id,
-                           a.result_json AS result_json
-                    FROM drafts d
-                    LEFT JOIN archives a ON a.draft_id = d.id
-                    WHERE d.id IN ({placeholders})""",
-                change_ids,
-            ).fetchall()
-            by_id = {r["id"]: r for r in rows}
+            queryable_ids = [
+                draft_id
+                for draft_id in change_ids
+                if _SQLITE_INT_MIN <= draft_id <= _SQLITE_INT_MAX
+            ]
+            by_id: dict[int, Any] = {}
+            if queryable_ids:
+                placeholders = ",".join("?" * len(queryable_ids))
+                rows = conn.execute(
+                    f"""SELECT d.id AS id, a.id AS archive_id,
+                               a.result_json AS result_json
+                        FROM drafts d
+                        LEFT JOIN archives a ON a.draft_id = d.id
+                        WHERE d.id IN ({placeholders})""",
+                    queryable_ids,
+                ).fetchall()
+                by_id = {r["id"]: r for r in rows}
             durations: dict[int, int] = {}
-            for draft_id in change_ids:
+            for draft_id, start in changes:
+                if not (_SQLITE_INT_MIN <= draft_id <= _SQLITE_INT_MAX):
+                    raise NotFound(f"炉次草稿 {draft_id} 不存在。")
                 r = by_id.get(draft_id)
                 if r is None:
                     raise NotFound(f"炉次草稿 {draft_id} 不存在。")
                 if r["archive_id"] is None:
                     raise Unprocessable(
                         f"炉次 {draft_id} 尚未归档，开炉计划只能安排已归档炉次。"
+                    )
+                # null 移除无需存储；设置值必须是 SQLite 可原样存下的非负整数
+                if start is not None and not (0 <= start <= _SQLITE_INT_MAX):
+                    raise Unprocessable(
+                        f"炉次 {draft_id} 的开始分钟 {start} 超出可存储范围"
+                        f"（最大 {_SQLITE_INT_MAX}），请提供更小的非负整数。"
                     )
                 durations[draft_id] = (
                     len(json.loads(r["result_json"])["temperatures"]) * 5

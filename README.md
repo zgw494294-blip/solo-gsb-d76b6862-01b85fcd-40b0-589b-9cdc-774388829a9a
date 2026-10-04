@@ -995,10 +995,14 @@ content-disposition: attachment; filename="draft-1-v1-sheet.html";
 
 - **409**：版本过期（响应体附 `currentVersion`，重新 GET 后再提交），
   或改动后存在排段重叠（中文说明冲突的两段炉次与区间）；
-- **404**：改动中的炉次 ID 未知；
+- **404**：改动中的炉次 ID 未知（包括超出 SQLite 有符号 64 位整数范围
+  `[-9223372036854775808, 9223372036854775807]`、无法入库查询的 ID，如
+  `9223372036854775808`，一律按未知炉次处理，不截断、不转浮点）；
 - **422**：炉次存在但**未归档**（活动 / 无解 / 已作废草稿，`null`
-  移除同样要求已归档），或请求体非法（版本 <1、改动非 1～20 项、ID
-  重复、开始分钟为负数 / 小数 / 布尔 / 字符串等）。
+  移除同样要求已归档）；或 `startMinute` 超出 SQLite 可存储的整数上限
+  `9223372036854775807`（服务原样存储，**不截断、不转为浮点数**，返回
+  中文原因）；或请求体非法（版本 <1、改动非 1～20 项、ID 重复、开始
+  分钟为负数 / 小数 / 布尔 / 字符串等）。
 
 并发与隔离：整批改动在**单条事务**里提交，同版本并发 PUT 只有**一批**
 成功，其余收到 **409**；任何 GET 都不会读到提交到一半的批次，看到的
@@ -1117,6 +1121,30 @@ curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
   -d '{"version": 3, "changes": [{"draftId": 4, "startMinute": 0}]}'
 # HTTP/1.1 422 Unprocessable Entity（炉次 4 还是活动草稿）
 # {"detail":"炉次 4 尚未归档，开炉计划只能安排已归档炉次。"}
+```
+
+整数超出 SQLite 有符号 64 位范围时同样给出明确错误（任何失败都整批回滚，
+**不截断、不转浮点**，计划与版本不变）：
+
+```bash
+# 未知整数炉次 ID（含超出有符号 64 位范围者）→ 404
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 9223372036854775808, "startMinute": 0}]}'
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 9223372036854775808 不存在。"}
+
+# 已归档炉次的开始分钟超出 SQLite 可存储上限 → 422（中文原因）
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 1, "startMinute": 9223372036854775808}]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"炉次 1 的开始分钟 9223372036854775808 超出可存储范围（最大 9223372036854775807），请提供更小的非负整数。"}
+
+# 上限值 9223372036854775807 本身可原样存储，照常接受（200，版本 +1）
+curl -sS -i -X PUT http://localhost:8000/api/furnace-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 3, "changes": [{"draftId": 1, "startMinute": 9223372036854775807}]}'
 ```
 
 ## 目录结构
